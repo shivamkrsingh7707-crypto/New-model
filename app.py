@@ -52,9 +52,10 @@ if IS_POSTGRES:
     app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
         'pool_pre_ping': True,
         'pool_recycle': 280,
-        'pool_size': 5,
-        'max_overflow': 10,
-        'pool_timeout': 30,
+        'pool_size': 3,
+        'max_overflow': 2,
+        'pool_timeout': 10,
+        'pool_use_lifo': True,
     }
 
 print(f"  Database: {'PostgreSQL (Production)' if IS_POSTGRES else 'SQLite (Local)'}")
@@ -111,7 +112,7 @@ class ChapterProgress(db.Model):
     subject = db.Column(db.String(100), nullable=False)
     chapter_index = db.Column(db.Integer, nullable=False)
     circle_index = db.Column(db.Integer, nullable=False)
-    completed = db.Column(db.Boolean, default=False)
+    completed = db.Column(db.Boolean, default=False, index=True)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow)
     __table_args__ = (
         db.UniqueConstraint('user_id', 'subject', 'chapter_index', 'circle_index'),
@@ -3142,14 +3143,19 @@ def analytics():
     circ_small = 226.19
     ring_dash_small = round((stats['overall_pct'] / 100) * circ_small, 2)
     ring_gap_small = round(circ_small - ring_dash_small, 2)
-    chapter_done_map = {}
-    for subject, info in curriculum.items():
-        chapter_done_map[subject] = {}
-        for ci in range(len(info['chapters'])):
-            done = ChapterProgress.query.filter_by(
-                user_id=user.id, subject=subject, chapter_index=ci, completed=True
-            ).count()
-            chapter_done_map[subject][ci] = done
+    # One aggregate query instead of one COUNT query per chapter.
+    chapter_rows = db.session.query(
+        ChapterProgress.subject, ChapterProgress.chapter_index,
+        func.count(ChapterProgress.id)
+    ).filter_by(user_id=user.id, completed=True).group_by(
+        ChapterProgress.subject, ChapterProgress.chapter_index
+    ).all()
+    chapter_counts = {(subject, ci): count for subject, ci, count in chapter_rows}
+    chapter_done_map = {
+        subject: {ci: chapter_counts.get((subject, ci), 0)
+                  for ci in range(len(info['chapters']))}
+        for subject, info in curriculum.items()
+    }
     week_data = get_7day_data(user.id)
     week_total = sum(d['count'] for d in week_data)
     week_avg = round(week_total / 7, 1)
@@ -3189,9 +3195,14 @@ def settings():
     stats = compute_stats(user.id)
     member_since = user.created_at.strftime('%b %d, %Y') if user.created_at else 'Recently'
     customs = CustomSubject.query.filter_by(user_id=user.id).order_by(CustomSubject.created_at).all()
+    custom_ids = [cs.id for cs in customs]
+    chapter_count_rows = (db.session.query(CustomChapter.subject_id, func.count(CustomChapter.id))
+                          .filter(CustomChapter.subject_id.in_(custom_ids))
+                          .group_by(CustomChapter.subject_id).all()) if custom_ids else []
+    chapter_count_map = dict(chapter_count_rows)
     custom_subjects = []
     for cs in customs:
-        count = CustomChapter.query.filter_by(subject_id=cs.id).count()
+        count = chapter_count_map.get(cs.id, 0)
         custom_subjects.append({
             "id": cs.id, "name": cs.name, "icon": cs.icon,
             "chapter_count": count
@@ -3247,8 +3258,22 @@ def reset():
 # Global language selector and presentation polish. Language is stored per signed-in session.
 @app.before_request
 def keep_login_session_permanent():
+    # Lightweight timing marker; logs only slow server-side requests on Render.
+    import time
+    request._st_started_at = time.perf_counter()
     if session.get("user_id"):
         session.permanent = True
+
+@app.after_request
+def log_slow_requests(response):
+    import time
+    started = getattr(request, "_st_started_at", None)
+    if started is not None:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        if elapsed_ms >= 700:
+            app.logger.warning("SLOW_REQUEST method=%s path=%s status=%s elapsed_ms=%.0f",
+                               request.method, request.path, response.status_code, elapsed_ms)
+    return response
 
 @app.after_request
 def studytracker_response_polish(response):
