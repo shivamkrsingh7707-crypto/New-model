@@ -693,10 +693,18 @@ def get_full_curriculum(user_id):
             "subject_id": None
         }
     customs = CustomSubject.query.filter_by(user_id=user_id).order_by(CustomSubject.created_at).all()
+    # Fetch all custom chapters in one query (avoid one SQL query per subject).
+    custom_ids = [cs.id for cs in customs]
+    chapters_by_subject = {sid: [] for sid in custom_ids}
+    if custom_ids:
+        custom_chapters = (CustomChapter.query
+            .filter(CustomChapter.subject_id.in_(custom_ids))
+            .order_by(CustomChapter.subject_id, CustomChapter.order_index, CustomChapter.id).all())
+        for chapter in custom_chapters:
+            chapters_by_subject[chapter.subject_id].append(chapter.name)
     for cs in customs:
-        cchapters = CustomChapter.query.filter_by(subject_id=cs.id).order_by(CustomChapter.order_index, CustomChapter.id).all()
         curriculum[cs.name] = {
-            "chapters": [c.name for c in cchapters],
+            "chapters": chapters_by_subject.get(cs.id, []),
             "meta": {"icon": cs.icon, "color_from": cs.color_from, "color_to": cs.color_to, "tag": cs.tag},
             "is_custom": True,
             "subject_id": cs.id
@@ -709,8 +717,8 @@ def get_user_progress(user_id):
     return {f"{r.subject}__{r.chapter_index}__{r.circle_index}": True for r in rows}
 
 
-def compute_stats(user_id):
-    curriculum = get_full_curriculum(user_id)
+def compute_stats(user_id, curriculum=None):
+    curriculum = curriculum if curriculum is not None else get_full_curriculum(user_id)
     total_circles = sum(len(v['chapters']) * CIRCLES_PER_CHAPTER for v in curriculum.values())
     completed_rows = ChapterProgress.query.filter_by(user_id=user_id, completed=True).count()
     overall_pct = round((completed_rows / total_circles) * 100, 1) if total_circles else 0
@@ -793,24 +801,33 @@ def log_activity(user_id, delta):
 
 def get_7day_data(user_id):
     today = date.today()
-    days = []
-    for i in range(6, -1, -1):
-        d = today - timedelta(days=i)
-        log = ActivityLog.query.filter_by(user_id=user_id, activity_date=d).first()
-        count = log.circles_completed if log else 0
-        days.append({
-            "date": d.strftime('%d %b'),
-            "day_label": d.strftime('%a'),
-            "count": count,
-            "is_today": (d == today)
-        })
-    return days
+    start_day = today - timedelta(days=6)
+    rows = ActivityLog.query.filter(
+        ActivityLog.user_id == user_id,
+        ActivityLog.activity_date >= start_day,
+        ActivityLog.activity_date <= today
+    ).all()
+    counts = {row.activity_date: (row.circles_completed or 0) for row in rows}
+    return [{
+        "date": (d := today - timedelta(days=i)).strftime('%d %b'),
+        "day_label": d.strftime('%a'),
+        "count": counts.get(d, 0),
+        "is_today": d == today
+    } for i in range(6, -1, -1)]
 
 
-def compute_exam_plans(user_id):
-    curriculum = get_full_curriculum(user_id)
-    stats = compute_stats(user_id)
+def compute_exam_plans(user_id, curriculum=None, stats=None):
+    curriculum = curriculum if curriculum is not None else get_full_curriculum(user_id)
+    stats = stats if stats is not None else compute_stats(user_id, curriculum)
     exams = ExamSchedule.query.filter_by(user_id=user_id).all()
+    # Aggregate all completed circles once; avoid an exam x chapter N+1 query loop.
+    chapter_done_rows = db.session.query(
+        ChapterProgress.subject, ChapterProgress.chapter_index,
+        func.count(ChapterProgress.id)
+    ).filter_by(user_id=user_id, completed=True).group_by(
+        ChapterProgress.subject, ChapterProgress.chapter_index
+    ).all()
+    chapter_done_lookup = {(subject, index): count for subject, index, count in chapter_done_rows}
     today = date.today()
     plans = []
     for exam in exams:
@@ -822,13 +839,10 @@ def compute_exam_plans(user_id):
         done_units = stats['subject_done_circles'].get(exam.subject, 0)
         remaining_units = max(0, total_units - done_units)
 
-        remaining_chapters = 0
-        for ci in range(total_ch):
-            done = ChapterProgress.query.filter_by(
-                user_id=user_id, subject=exam.subject, chapter_index=ci, completed=True
-            ).count()
-            if done < CIRCLES_PER_CHAPTER:
-                remaining_chapters += 1
+        remaining_chapters = sum(
+            1 for ci in range(total_ch)
+            if chapter_done_lookup.get((exam.subject, ci), 0) < CIRCLES_PER_CHAPTER
+        )
 
         days_left = (exam.exam_date - today).days
 
@@ -2708,15 +2722,15 @@ def index():
         return redirect(url_for('onboarding'))
     touch_user(user)
     update_streak(user)
-    stats = compute_stats(user.id)
     curriculum = get_full_curriculum(user.id)
+    stats = compute_stats(user.id, curriculum)
     circ = 251.33
     ring_dash = round((stats['overall_pct'] / 100) * circ, 2)
     ring_gap = round(circ - ring_dash, 2)
     week_data = get_7day_data(user.id)
     week_total = sum(d['count'] for d in week_data)
     week_max = max((d['count'] for d in week_data), default=0)
-    exam_plans = compute_exam_plans(user.id)
+    exam_plans = compute_exam_plans(user.id, curriculum, stats)
     nearest_exam = None
     for p in exam_plans:
         if p['status'] in ('upcoming', 'today'):
@@ -2801,7 +2815,7 @@ def subject_page(subject_name):
     subj_done = sum(chapter_fill_counts.values())
     subject_pct = round((subj_done / subj_total) * 100, 1) if subj_total else 0
     exam_plan = None
-    for p in compute_exam_plans(user.id):
+    for p in compute_exam_plans(user.id, curriculum):
         if p['subject'] == subject_name:
             exam_plan = p; break
     return render_template_string(
@@ -3269,6 +3283,16 @@ def studytracker_response_polish(response):
         @media(prefers-reduced-motion:no-preference){.fade-in{animation-duration:.28s!important}.chapter-bar,.bar-chart-bar{transition:width .18s ease,transform .18s ease!important}}
         @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation-duration:.01ms!important;transition-duration:.01ms!important}}
         @media(max-width:520px){#st-global-tools{top:8px;right:8px;transform:scale(.94);transform-origin:top right}.scroll-content{padding-top:20px}}
+
+        /* Mobile performance guard: preserve the glass look with cheaper compositing. */
+        @media(max-width:700px){
+          .glass-nav{backdrop-filter:blur(9px)!important;-webkit-backdrop-filter:blur(9px)!important}
+          .card-base,.chapter-row,.modal-content{box-shadow:0 7px 18px rgba(0,0,0,.16)!important}
+          .fade-in{animation:none!important}
+        }
+        @media(prefers-reduced-transparency:reduce){
+          .glass-nav{backdrop-filter:none!important;-webkit-backdrop-filter:none!important;background:rgba(12,15,28,.96)!important}
+        }
         </style>
         """
         translator = r"""
@@ -3318,7 +3342,7 @@ def studytracker_response_polish(response):
           }
           const useHindi = document.documentElement.lang==='hi';
           if(useHindi && document.body) translateNode(document.body);
-          window.addEventListener('DOMContentLoaded',()=>{if(useHindi)translateNode(document.body)});
+          // The script is injected immediately before </body>; translate once only.
         })();
         </script>
         """
