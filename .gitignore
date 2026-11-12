@@ -1,0 +1,14 @@
+# Secrets — never commit
+.secret_key
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Local database
+instance/
+*.db
+
+# Local backups / scratch files
+app_backup.py
+cc.py
