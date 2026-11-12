@@ -1,5 +1,7 @@
 import os
 import json
+import threading
+import time
 from functools import lru_cache
 from flask import Flask, request, session, redirect, url_for, jsonify
 from flask_sqlalchemy import SQLAlchemy
@@ -2731,6 +2733,11 @@ def set_class():
 # HTTP ROUTES
 # 
 
+@app.route('/healthz')
+def healthz():
+    return jsonify({"status": "ok"})
+
+
 @app.route('/')
 def index():
     user = get_current_user()
@@ -3635,8 +3642,35 @@ def init_db():
             print(f"  Backfill warning: {e}")
 
 
+# Render free web services sleep after ~15 minutes without traffic. A request
+# to our own health endpoint every 10 minutes keeps the instance warm.
+def _start_render_keep_alive():
+    if os.environ.get('KEEP_ALIVE', '1') == '0':
+        return
+    url = os.environ.get('RENDER_EXTERNAL_URL')
+    if not url:
+        host = os.environ.get('RENDER_EXTERNAL_HOSTNAME')
+        if host:
+            url = 'https://' + host
+    if not url:
+        return
+    endpoint = url.rstrip('/') + '/healthz'
+
+    def ping_loop():
+        from urllib.request import urlopen
+        while True:
+            time.sleep(600)
+            try:
+                urlopen(endpoint, timeout=20).read()
+            except Exception:
+                pass
+
+    threading.Thread(target=ping_loop, daemon=True, name='render-keepalive').start()
+
+
 # Initialize DB immediately when this module is imported (needed for Gunicorn on Render)
 init_db()
+_start_render_keep_alive()
 
 
 if __name__ == '__main__':
