@@ -1,6 +1,7 @@
 import os
 import json
-from flask import Flask, render_template_string, request, session, redirect, url_for, jsonify
+from functools import lru_cache
+from flask import Flask, request, session, redirect, url_for, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from datetime import datetime, date, timedelta
@@ -61,7 +62,21 @@ if IS_POSTGRES:
 print(f"  Database: {'PostgreSQL (Production)' if IS_POSTGRES else 'SQLite (Local)'}")
 
 db = SQLAlchemy(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet' if IS_POSTGRES else 'threading')
+# Threading works with the Gunicorn sync worker + simple-websocket from the Procfile.
+# Requesting eventlet here without eventlet installed makes production fail to boot.
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+
+@lru_cache(maxsize=None)
+def _compiled_template(source):
+    # render_template_string recompiles the template on every request. These
+    # templates are 20-30 KB each, so cache the compiled Jinja Template instead.
+    return app.jinja_env.from_string(source)
+
+
+def render_page(source, **context):
+    app.update_template_context(context)
+    return _compiled_template(source).render(context)
 
 # 
 # LIVE ONLINE TRACKING
@@ -2637,7 +2652,7 @@ def learning_studio():
         total_chapters += len(info["chapters"])
         done = sum(1 for key, value in progress.items() if value and key.startswith(subject + "__"))
         subject_progress[subject] = round(done / (len(info["chapters"]) * CIRCLES_PER_CHAPTER) * 100, 1) if info["chapters"] else 0
-    return render_template_string(
+    return render_page(
         LEARNING_STUDIO_TEMPLATE, user=user, grade=grade, curriculum=curriculum,
         subject_progress=subject_progress, total_chapters=total_chapters,
         language=session.get("language","en"), session_label=CBSE_SYLLABUS_SESSION,
@@ -2658,7 +2673,7 @@ def learning_subject(grade, subject):
     chapters = curriculum[subject]["chapters"]
     chapter_names = [HINDI_TITLES.get(name, name) if language == "hi" else name for name in chapters]
     display_subject = HINDI_TITLES.get(subject, subject.replace("English —", "अंग्रेज़ी —")) if language == "hi" else subject
-    return render_template_string(
+    return render_page(
         LEARNING_SUBJECT_TEMPLATE, user=user, grade=grade, subject=subject,
         display_subject=display_subject, chapters=chapters, chapter_names=chapter_names,
         language=language, nav_html=bottom_nav_html("hub")
@@ -2676,7 +2691,7 @@ def chapter_studio(grade, subject, chapter_index):
         return redirect(url_for('learning_studio', grade=grade))
     chapter = curriculum[subject]["chapters"][chapter_index]
     pack = get_chapter_study_pack(grade, subject, chapter)
-    return render_template_string(
+    return render_page(
         CHAPTER_STUDIO_TEMPLATE, user=user, grade=grade, subject=subject,
         chapter=chapter, chapter_index=chapter_index, pack=pack,
         display_subject=HINDI_TITLES.get(subject, subject) if session.get("language","en") == "hi" else subject,
@@ -2736,7 +2751,7 @@ def index():
     for p in exam_plans:
         if p['status'] in ('upcoming', 'today'):
             nearest_exam = p; break
-    return render_template_string(
+    return render_page(
         DASHBOARD_TEMPLATE,
         user=user, stats=stats, curriculum=curriculum,
         ring_dash=ring_dash, ring_gap=ring_gap,
@@ -2753,7 +2768,7 @@ def index():
 def onboarding():
     if get_current_user():
         return redirect(url_for('index'))
-    return render_template_string(
+    return render_page(
         ONBOARDING_TEMPLATE, error=None,
         online_count=get_live_online_count(),
         total_users=get_total_user_count()
@@ -2765,12 +2780,12 @@ def setup():
     name = request.form.get('name', '').strip()
     student_class = request.form.get('student_class', '').strip()
     if not name or not student_class:
-        return render_template_string(
+        return render_page(
             ONBOARDING_TEMPLATE, error="Please fill in all fields.",
             online_count=get_live_online_count(), total_users=get_total_user_count()
         )
     if len(name) > 100 or len(student_class) > 50:
-        return render_template_string(
+        return render_page(
             ONBOARDING_TEMPLATE, error="Input too long.",
             online_count=get_live_online_count(), total_users=get_total_user_count()
         )
@@ -2783,7 +2798,7 @@ def setup():
         db.session.commit()
     except Exception as e:
         db.session.rollback()
-        return render_template_string(
+        return render_page(
             ONBOARDING_TEMPLATE, error=f"Setup failed: {str(e)[:100]}",
             online_count=get_live_online_count(), total_users=get_total_user_count()
         )
@@ -2819,7 +2834,7 @@ def subject_page(subject_name):
     for p in compute_exam_plans(user.id, curriculum):
         if p['subject'] == subject_name:
             exam_plan = p; break
-    return render_template_string(
+    return render_page(
         SUBJECT_TEMPLATE,
         user=user, subject=subject_name, chapters=chapters, meta=meta, info=info,
         progress_map=progress_map, circle_labels=CIRCLE_LABELS,
@@ -3028,7 +3043,7 @@ def exam_zone():
     for p in exam_plans:
         if p['status'] in ('upcoming', 'today'):
             nearest_days = p['days_left']; break
-    return render_template_string(
+    return render_page(
         EXAM_ZONE_TEMPLATE,
         user=user, exam_plans=exam_plans, all_subjects=all_subjects,
         today_iso=date.today().isoformat(), today_target=today_target,
@@ -3119,7 +3134,7 @@ def chat():
     initial_msg_ids = [m['id'] for m in messages]
     online_users_list = get_live_online_users()
     online_users_data = [{"name": u['name'], "student_class": u['student_class'], "avatar_color": u.get('avatar_color', '#A9DFFF')} for u in online_users_list]
-    return render_template_string(
+    return render_page(
         CHAT_TEMPLATE,
         user=user, messages=messages, initial_msg_ids=initial_msg_ids,
         chat_rooms=CHAT_ROOMS, current_room=room_id,
@@ -3160,7 +3175,7 @@ def analytics():
     week_total = sum(d['count'] for d in week_data)
     week_avg = round(week_total / 7, 1)
     week_max = max((d['count'] for d in week_data), default=0)
-    return render_template_string(
+    return render_page(
         ANALYTICS_TEMPLATE,
         user=user, stats=stats, curriculum=curriculum,
         ring_dash_small=ring_dash_small, ring_gap_small=ring_gap_small,
@@ -3207,7 +3222,7 @@ def settings():
             "id": cs.id, "name": cs.name, "icon": cs.icon,
             "chapter_count": count
         })
-    return render_template_string(
+    return render_page(
         SETTINGS_TEMPLATE,
         user=user, overall_pct=stats['overall_pct'],
         msg=msg, member_since=member_since,
@@ -3419,11 +3434,7 @@ def on_connect():
             'room': None,
             'connected_at': datetime.utcnow()
         }
-        try:
-            user.last_seen = datetime.utcnow()
-            db.session.commit()
-        except Exception:
-            db.session.rollback()
+        touch_user(user)
     broadcast_presence()
 
 
@@ -3632,7 +3643,7 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     debug_mode = not IS_POSTGRES
     print(f" StudyTracker running on http://0.0.0.0:{port}")
-    print(f" Real-time chat enabled (async_mode: {'eventlet' if IS_POSTGRES else 'threading'})")
+    print(" Real-time chat enabled (async_mode: threading)")
     socketio.run(
         app,
         host='0.0.0.0',
